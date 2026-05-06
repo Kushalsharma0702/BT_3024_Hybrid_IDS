@@ -94,6 +94,10 @@ function launchSimulation(){
   const _bn=document.getElementById('bypassNote'); if(_bn){_bn.style.display='none';_bn.innerHTML='';}
   document.getElementById('simProgressBar').style.width='0%';
   document.getElementById('simStatusText').textContent='Launching attack\u2026';
+  const _bkl=document.getElementById('bypassKpiLabel');
+  const _clb=document.getElementById('chartLblBypass');
+  if(_bkl) _bkl.textContent='Bypassed IDS';
+  if(_clb) _clb.textContent='Bypassed IDS';
   ['liveFlooded','liveBlocked'].forEach(id=>document.getElementById(id).textContent='0');
   document.getElementById('liveRate').textContent='-';
 
@@ -145,48 +149,58 @@ function _setBar(id,valId,count,total){
 }
 
 function _showResults(data){
-  document.getElementById('simStatusText').textContent='&#x2714; Simulation complete';
+  document.getElementById('simStatusText').textContent='\u2714 Simulation complete';
   document.getElementById('simProgressBar').style.width='100%';
   document.getElementById('liveFlooded').textContent=data.total_flooded;
   document.getElementById('liveBlocked').textContent=data.total_blocked;
   document.getElementById('liveRate').textContent=(data.detection_rate*100).toFixed(1)+'%';
 
   const btn=document.getElementById('simBtn');
-  btn.disabled=false;btn.innerHTML='<span class="btn-icon">&#x26A1;</span> Launch Simulation';
+  btn.disabled=false;btn.innerHTML='<span class="btn-icon">\u26A1</span> Launch Simulation';
 
   setTimeout(()=>{
     document.getElementById('simResults').style.display='block';
     const T=data.total_flooded;
+    const cfg=data.config||{};
+    const isMixed=cfg.attack_type==='mixed';
+    const isNormal=cfg.attack_type==='normal';
+    const normalPassed=Number(data.normal_passed)||0;
+    const trueBypassed=isMixed?Math.max(0,(data.bypassed||0)-normalPassed):(data.bypassed||0);
+
+    const bypassLbl=document.getElementById('bypassKpiLabel');
+    const chartLbl=document.getElementById('chartLblBypass');
+    if(isMixed&&normalPassed>0){
+      if(bypassLbl) bypassLbl.textContent='Total not blocked';
+      if(chartLbl) chartLbl.textContent='Attack bypass (true)';
+    }else{
+      if(bypassLbl) bypassLbl.textContent='Bypassed IDS';
+      if(chartLbl) chartLbl.textContent='Bypassed IDS';
+    }
+
     _animCount('res-flooded',data.total_flooded,900);
     _animCount('res-blocked',data.total_blocked,900);
     _animCount('res-rate',Math.round(data.detection_rate*1000),900,v=>((v/10).toFixed(1)+'%'));
     _animCount('res-bypassed',data.bypassed,900);
     _setBar('bar-sig','val-sig',data.blocked_by_signature,T);
     _setBar('bar-ml','val-ml',data.blocked_by_ml,T);
-    // For mixed: show normal-traffic-passed separately so "bypassed" only = true bypasses
-    const trueBypassed = isMixed ? (data.bypassed - (data.normal_passed||0)) : data.bypassed;
+
     const normRow=document.getElementById('normRow');
-    if(isMixed && data.normal_passed>0){
-      _setBar('bar-byp','val-byp', trueBypassed, T);
-      _setBar('bar-norm','val-norm', data.normal_passed, T);
+    if(isMixed&&normalPassed>0){
+      _setBar('bar-byp','val-byp',trueBypassed,T);
+      _setBar('bar-norm','val-norm',normalPassed,T);
       if(normRow) normRow.style.display='flex';
-    } else {
-      _setBar('bar-byp','val-byp', data.bypassed, T);
+    }else{
+      _setBar('bar-byp','val-byp',data.bypassed,T);
       if(normRow) normRow.style.display='none';
     }
 
-    // bypass / detection explanation note
-    const cfg=data.config||{};
-    const isMixed=cfg.attack_type==='mixed';
-    const isNormal=cfg.attack_type==='normal';
     let bypassNote='';
     if(isNormal){
       bypassNote='&#x2705; Normal traffic baseline &mdash; 0 false positives. All packets correctly allowed through.';
-    } else if(isMixed && data.normal_passed>0){
+    } else if(isMixed&&normalPassed>0){
       const atkRate=(data.detection_rate*100).toFixed(1);
       bypassNote=`&#x2139; Mixed mode sends <b>25% normal traffic</b> alongside attacks. `
-        +`The <b>${data.normal_passed}</b> bypassed packets are benign flows the IDS correctly let through &mdash; `
-        +`blocking them would be false positives. `
+        +`The <b>${normalPassed}</b> non-blocked packets in the benign slice are expected. `
         +`<b>True attack detection rate: ${atkRate}%</b> (${data.attack_blocked} / ${data.attack_flooded} attack packets blocked).`;
     } else if(data.bypassed===0){
       bypassNote='&#x1F6E1; IDS blocked 100% of attack traffic.';
@@ -197,7 +211,6 @@ function _showResults(data){
     const noteEl=document.getElementById('bypassNote');
     if(noteEl){noteEl.innerHTML=bypassNote; noteEl.style.display='block';}
 
-    // breakdown for mixed
     if(data.breakdown){
       const bd=document.getElementById('simBreakdown');
       let html='<div class="breakdown-wrap"><div class="breakdown-title">Per-Type Breakdown</div><table><thead><tr><th>Type</th><th>Sent</th><th>Blocked</th><th>Sig</th><th>ML</th><th>Rate</th></tr></thead><tbody>';
@@ -208,6 +221,8 @@ function _showResults(data){
       html+='</tbody></table></div>';
       bd.innerHTML=html;
     }
+
+    refreshLive().catch(e=>console.error('[post-sim refresh]',e));
   },200);
 }
 

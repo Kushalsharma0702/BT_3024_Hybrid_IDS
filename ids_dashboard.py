@@ -1,7 +1,8 @@
 import json
 import random
 import re
-from datetime import datetime
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -20,8 +21,109 @@ app = Flask(__name__)
 
 ALERT_JSON_PATTERN = re.compile(r"ALERT\s+(\{.*\})")
 
+_SIM_LOCK = threading.Lock()
+_SIM_ALERTS: list[dict[str, Any]] = []
+_MAX_SIM_ALERTS = 400
+
 
 # ── alert / history helpers ────────────────────────────────────────────────────
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _fake_ip(seed: int) -> str:
+    n = seed % (256**3)
+    return f"10.{(n >> 16) & 255}.{((n >> 8) & 255) or 1}.{(n & 255) or 2}"
+
+
+def _append_simulation_alerts(result: dict[str, Any]) -> None:
+    """Append synthetic rows so the Recent Alerts table reflects the last run."""
+    cfg = result.get("config") or {}
+    at = str(cfg.get("attack_type", "unknown"))
+    ts = _utc_now_iso()
+    rows: list[dict[str, Any]] = []
+
+    tf = int(result.get("total_flooded", 0))
+    tb = int(result.get("total_blocked", 0))
+    sig = int(result.get("blocked_by_signature", 0))
+    ml = int(result.get("blocked_by_ml", 0))
+    rate = float(result.get("detection_rate", 0.0))
+
+    rows.append(
+        {
+            "timestamp": ts,
+            "source_ip": "10.255.0.1",
+            "attack_type": f"Simulation · {at}",
+            "severity": "INFO",
+            "confidence": 1.0,
+            "method": "simulation",
+        }
+    )
+    rows.append(
+        {
+            "timestamp": ts,
+            "source_ip": "10.255.0.2",
+            "attack_type": f"Sim: {tb}/{tf} blocked (sig {sig}, ML {ml}, rate {rate * 100:.1f}%)",
+            "severity": "LOW",
+            "confidence": round(min(1.0, max(0.0, rate)), 4),
+            "method": "simulation",
+        }
+    )
+
+    br = result.get("breakdown")
+    if isinstance(br, dict) and br:
+        for label, sub in br.items():
+            if not isinstance(sub, dict):
+                continue
+            sf = int(sub.get("total_flooded", 0))
+            name = str(label)
+            is_norm = "normal" in name.lower()
+            n_samples = min(10, max(4, sf // 15 + 2))
+            for i in range(n_samples):
+                h = hash(f"{name}|{i}|{ts}") % (2**31)
+                rows.append(
+                    {
+                        "timestamp": ts,
+                        "source_ip": _fake_ip(h),
+                        "attack_type": "Normal (sim)" if is_norm else name,
+                        "severity": "LOW" if is_norm else "HIGH",
+                        "confidence": round(random.uniform(0.12, 0.35), 4)
+                        if is_norm
+                        else round(random.uniform(0.88, 0.99), 6),
+                        "method": "simulation",
+                    }
+                )
+    else:
+        labels = {
+            "syn_flood": "SYN flood",
+            "port_scan": "Port scan",
+            "dos_pattern": "DoS pattern",
+            "normal": "Normal traffic",
+        }
+        label = labels.get(at, at)
+        n_samples = min(32, max(8, tf // 20))
+        for i in range(n_samples):
+            h = hash(f"{at}|{i}|{ts}") % (2**31)
+            is_norm = at == "normal"
+            rows.append(
+                {
+                    "timestamp": ts,
+                    "source_ip": _fake_ip(h),
+                    "attack_type": label,
+                    "severity": "LOW" if is_norm else "HIGH",
+                    "confidence": round(random.uniform(0.1, 0.32), 4)
+                    if is_norm
+                    else round(random.uniform(0.88, 0.99), 6),
+                    "method": "simulation",
+                }
+            )
+
+    with _SIM_LOCK:
+        _SIM_ALERTS.extend(rows)
+        if len(_SIM_ALERTS) > _MAX_SIM_ALERTS:
+            del _SIM_ALERTS[: len(_SIM_ALERTS) - _MAX_SIM_ALERTS]
 
 def _safe_load_json(path: Path) -> Any:
     if not path.exists():
@@ -60,10 +162,12 @@ def _load_alerts_from_log(path: Path) -> list[dict[str, Any]]:
 
 
 def _get_live_alerts() -> list[dict[str, Any]]:
-    alerts = _load_alerts_from_json(ALERTS_JSON)
-    if alerts:
-        return alerts
-    return _load_alerts_from_log(ALERTS_LOG)
+    disk = _load_alerts_from_json(ALERTS_JSON)
+    if not disk:
+        disk = _load_alerts_from_log(ALERTS_LOG)
+    with _SIM_LOCK:
+        buf = list(_SIM_ALERTS)
+    return disk + buf
 
 
 def _summarize_alerts(alerts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -539,6 +643,7 @@ def api_simulate() -> Any:
     packet_count = int(data.get("packet_count", 500))
     packet_count = max(50, min(2000, packet_count))
     result = _run_simulation(attack_type, packet_count)
+    _append_simulation_alerts(result)
     return jsonify(result)
 
 
@@ -902,7 +1007,7 @@ def index() -> str:
           <div class=\"result-v clr-accent\" id=\"res-rate\">0%</div>
         </div>
         <div class=\"result-card\">
-          <div class=\"result-k\">Bypassed IDS</div>
+          <div class=\"result-k\" id=\"bypassKpiLabel\">Bypassed IDS</div>
           <div class=\"result-v clr-warn\" id=\"res-bypassed\">0</div>
         </div>
       </div>
@@ -917,7 +1022,7 @@ def index() -> str:
           <div class=\"chart-track\"><div class=\"chart-bar bar-ml\" id=\"bar-ml\"></div><span class=\"chart-val\" id=\"val-ml\">0</span></div>
         </div>
         <div class=\"chart-row\">
-          <span class=\"chart-lbl\">Bypassed IDS</span>
+          <span class=\"chart-lbl\" id=\"chartLblBypass\">Bypassed IDS</span>
           <div class=\"chart-track\"><div class=\"chart-bar bar-byp\" id=\"bar-byp\"></div><span class=\"chart-val\" id=\"val-byp\">0</span></div>
         </div>
         <div class=\"chart-row\" id=\"normRow\" style=\"display:none\">
@@ -961,7 +1066,7 @@ def index() -> str:
   <div class=\"footer\">Data: <code>logs/</code> &amp; <code>test_runs/</code> &mdash; auto-refresh every 5 s. Click a run row to inspect historical alerts.</div>
 </div>
 
-<script src=\"/dashboard.js?v=3\" defer></script>
+<script src=\"/dashboard.js?v=4\" defer></script>
 </body>
 </html>"""
 
