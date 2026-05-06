@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import joblib
 import pandas as pd
-from scapy.all import IP, TCP, UDP, sniff
+from scapy.all import IP, TCP, UDP, Raw, sniff
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -61,6 +61,17 @@ STATS: Dict[str, int] = {
     "signature_hits": 0,
     "alerts_generated": 0,
     "possible_false_positives": 0,
+}
+
+SIM_STATS: Dict[str, int] = {
+    "syn_flood_packets_actual": 0,
+    "syn_flood_packets_flagged": 0,
+    "dos_packets_actual": 0,
+    "dos_packets_flagged": 0,
+    "portscan_packets_actual": 0,
+    "portscan_packets_flagged": 0,
+    "normal_packets_actual": 0,
+    "normal_packets_flagged": 0,
 }
 
 
@@ -427,7 +438,15 @@ def _append_alert_to_json(alert: Dict[str, Any]) -> None:
             existing = []
 
         existing.append(alert)
-        ALERTS_JSON_PATH.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        try:
+            ALERTS_JSON_PATH.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        except PermissionError:
+            _log_throttled(
+                "warning",
+                "alerts_json_permission",
+                "Permission denied writing %s; skipping file write",
+                ALERTS_JSON_PATH,
+            )
 
 
 def alert_manager(decision: Dict[str, Any], features: Dict[str, Any]) -> None:
@@ -466,6 +485,18 @@ def _process_packet(packet: Any) -> None:
     with stats_lock:
         STATS["total_packets"] += 1
 
+    sim_label = getattr(packet, "sim_label", None)
+    if sim_label:
+        with stats_lock:
+            if sim_label == "syn_flood":
+                SIM_STATS["syn_flood_packets_actual"] += 1
+            elif sim_label == "dos_pattern":
+                SIM_STATS["dos_packets_actual"] += 1
+            elif sim_label == "portscan":
+                SIM_STATS["portscan_packets_actual"] += 1
+            elif sim_label == "normal":
+                SIM_STATS["normal_packets_actual"] += 1
+
     features = extract_features(packet)
     if features is None:
         return
@@ -485,6 +516,18 @@ def _process_packet(packet: Any) -> None:
             STATS["anomalies_detected"] += 1
         elif anomaly_result.get("uncertain", False):
             STATS["possible_false_positives"] += 1
+
+    if sim_label:
+        with stats_lock:
+            flagged = decision["status"] in {"SIGNATURE_ALERT", "ANOMALY_ALERT"}
+            if sim_label == "syn_flood" and flagged:
+                SIM_STATS["syn_flood_packets_flagged"] += 1
+            elif sim_label == "dos_pattern" and flagged:
+                SIM_STATS["dos_packets_flagged"] += 1
+            elif sim_label == "portscan" and flagged:
+                SIM_STATS["portscan_packets_flagged"] += 1
+            elif sim_label == "normal" and flagged:
+                SIM_STATS["normal_packets_flagged"] += 1
 
     alert_manager(decision, features)
 
@@ -512,8 +555,86 @@ def capture_packets(interface: Optional[str] = None, packet_count: int = 0) -> N
             print(f"{key}: {value}")
 
 
+def _build_simulated_packets() -> List[Any]:
+    packets: List[Any] = []
+
+    # Baseline normal HTTP traffic
+    for i in range(200):
+        packets.append(
+            IP(src=f"192.168.1.{10 + (i % 10)}", dst="10.0.0.1")
+            / TCP(sport=50000 + i, dport=80, flags="PA")
+            / Raw(load=b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        )
+        packets[-1].sim_label = "normal"
+
+    # Port scan setup: many unique ports
+    for port in range(20, 45):
+        packets.append(
+            IP(src="10.0.0.50", dst="192.168.1.200")
+            / TCP(sport=12345, dport=port, flags="S")
+        )
+        packets[-1].sim_label = "portscan"
+
+    # Port scan trigger: repeated hits to one port to raise spkts
+    for i in range(25):
+        packets.append(
+            IP(src="10.0.0.50", dst="192.168.1.200")
+            / TCP(sport=12345, dport=80, flags="S")
+        )
+        packets[-1].sim_label = "portscan"
+
+    # SYN flood trigger
+    for i in range(150):
+        packets.append(
+            IP(src="10.0.0.60", dst="192.168.1.210")
+            / TCP(sport=40000, dport=443, flags="S")
+        )
+        packets[-1].sim_label = "syn_flood"
+
+    # DoS pattern trigger (high packet count on one flow)
+    for i in range(500):
+        packets.append(
+            IP(src="10.0.0.70", dst="192.168.1.220")
+            / TCP(sport=41000, dport=8080, flags="PA")
+            / Raw(load=b"A" * 1400)
+        )
+        packets[-1].sim_label = "dos_pattern"
+
+    return packets
+
+
+def run_simulation() -> None:
+    print("--- Hybrid IDS Simulation ---")
+    print(f"Model: {MODEL_PATH}")
+    print(f"Scaler: {SCALER_PATH}")
+    packets = _build_simulated_packets()
+    for pkt in packets:
+        _process_packet(pkt)
+
+    print("\n--- IDS Summary ---")
+    for key, value in STATS.items():
+        print(f"{key}: {value}")
+
+    if any(value > 0 for value in SIM_STATS.values()):
+        print("\n--- Simulation Label Summary ---")
+        for key, value in SIM_STATS.items():
+            print(f"{key}: {value}")
+
+
 def _build_cli() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Production-grade Hybrid IDS")
+    parser.add_argument(
+        "--mode",
+        choices=["live", "simulate"],
+        default="live",
+        help="Capture mode (default: live)",
+    )
+    parser.add_argument(
+        "--anomaly-threshold",
+        type=float,
+        default=ANOMALY_THRESHOLD,
+        help="Anomaly confidence threshold (default: 0.90)",
+    )
     parser.add_argument("--iface", type=str, default=None, help="Network interface for capture")
     parser.add_argument(
         "--count",
@@ -527,6 +648,15 @@ def _build_cli() -> argparse.ArgumentParser:
 def main() -> None:
     parser = _build_cli()
     args = parser.parse_args()
+    if not (0.0 < args.anomaly_threshold <= 1.0):
+        parser.error("--anomaly-threshold must be in (0.0, 1.0]")
+
+    global ANOMALY_THRESHOLD
+    ANOMALY_THRESHOLD = float(args.anomaly_threshold)
+    if args.mode == "simulate":
+        run_simulation()
+        return
+
     capture_packets(interface=args.iface, packet_count=args.count)
 
 
